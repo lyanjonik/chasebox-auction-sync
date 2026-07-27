@@ -1,0 +1,36 @@
+# Chase Box — auction tag/current-bid sync, running on GitHub's always-on runners.
+# This replaces the local Windows scheduled task so the storefront stays correct 24/7,
+# independent of your PC being on. Reconciles wk_auction / wk_end_auction + writes
+# custom.current_bid / custom.bid_count by reading Webkul's live auction endpoints.
+#
+# In the repo this file MUST live at:  .github/workflows/auction-sync.yml
+name: Chase Box Auction Sync
+
+on:
+  schedule:
+    # Every 5 minutes — GitHub's minimum interval (local task was 2 min). The product
+    # page stays real-time via Webkul; only the collection/card headline lags a few min.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:  # lets you run it by hand from the Actions tab (for testing)
+
+# Never let two runs overlap; if one is slow, skip the next rather than double-write.
+concurrency:
+  group: auction-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SHOPIFY_STORE: sqqmcb-gz.myshopify.com
+      SHOPIFY_API_VERSION: "2025-07"
+      # The only secret. Set it in: repo Settings -> Secrets and variables -> Actions.
+      SHOPIFY_ADMIN_TOKEN: ${{ secrets.SHOPIFY_ADMIN_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Reconcile auction tags + current bid
+        run: python auction_sync.py --verbose
