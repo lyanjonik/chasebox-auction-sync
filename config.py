@@ -39,12 +39,16 @@ DB_PATH = os.environ.get("COMPS_DB_PATH", os.path.join(os.path.dirname(__file__)
 # Credentials (all optional — engine runs in SIM mode when absent)
 # ---------------------------------------------------------------------------
 
-SHOPIFY_STORE = os.environ.get("SHOPIFY_STORE", "chase-box.myshopify.com")
-SHOPIFY_ADMIN_TOKEN = os.environ.get("SHOPIFY_ADMIN_TOKEN", "")   # shpat_...
-SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2025-07")
+# .strip() on every credential/config: a secret pasted into a GitHub Actions secret box
+# (or a .env line) often carries a trailing newline. urllib refuses a header value with a
+# newline ("Invalid header value b'***\\n'"), which failed the first live GitHub run.
+# Stripping makes the token robust to however it was entered.
+SHOPIFY_STORE = os.environ.get("SHOPIFY_STORE", "chase-box.myshopify.com").strip()
+SHOPIFY_ADMIN_TOKEN = os.environ.get("SHOPIFY_ADMIN_TOKEN", "").strip()   # shpat_...
+SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2025-07").strip()
 
-PRICECHARTING_TOKEN = os.environ.get("PRICECHARTING_TOKEN", "")   # TCG
-SPORTSCARDSPRO_TOKEN = os.environ.get("SPORTSCARDSPRO_TOKEN", "")  # sports cards
+PRICECHARTING_TOKEN = os.environ.get("PRICECHARTING_TOKEN", "").strip()   # TCG
+SPORTSCARDSPRO_TOKEN = os.environ.get("SPORTSCARDSPRO_TOKEN", "").strip()  # sports cards
 
 FX_API_URL = os.environ.get("FX_API_URL", "https://open.er-api.com/v6/latest/USD")
 
