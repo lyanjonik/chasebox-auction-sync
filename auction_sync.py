@@ -175,12 +175,16 @@ def live_auction_ids(product_ids: list[str]) -> set[str]:
     return {k for k in data.keys() if k != "theme"}
 
 
-def fetch_bid_data(prod_id: str) -> tuple[int | None, int] | None:
-    """Return (current_bid_cents, bid_count) for a product's LIVE auction, or None on error.
-    Reads Webkul's biddingform widget (the same data the product page shows). 'Current bid'
-    is the highest bid so far; with zero bids it's the opening/start amount. Figures verified
-    against live auctions 2026-07-27 (min_bid_amount var = next-min bid; 'Maximum bidding
-    amount allowed' text = current highest, exactly one increment below next-min)."""
+def fetch_auction_state(prod_id: str) -> tuple[str | None, int | None, int]:
+    """Read Webkul's biddingform widget — the AUTHORITATIVE per-product source (the card
+    endpoint lags on ended auctions and can't be trusted for state). Returns
+    (state, bid_cents, count) where state is:
+      'live'  — bidding open; bid_cents = current highest (or opening amount at 0 bids)
+      'ended' — bidding closed; bid_cents = FINAL price ("Auction Ended At: PHP X")
+      'none'  — no auction configured on this lot yet (pending)
+      None    — fetch/parse error; caller should change nothing
+    Verified 2026-07-27: live has `var min_bid_amount` + 'Maximum bidding amount allowed';
+    ended has 'Bidding closed for this product' + 'Auction Ended At: PHP <final>'."""
     params = {
         "shop_name": config.SHOPIFY_STORE, "prod_id": prod_id, "cust_id": "",
         "page": "product", "timediff": WK_TIMEDIFF, "callback": "biddingform",
@@ -195,27 +199,32 @@ def fetch_bid_data(prod_id: str) -> tuple[int | None, int] | None:
         m = re.match(r"^[^(]*\((.*)\)\s*;?\s*$", raw, re.S)
         html = json.loads(m.group(1)) if m else ""
     except Exception:
-        return None
+        return None, None, 0
     if not isinstance(html, str) or not html:
-        return None
+        return None, None, 0
 
     text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html))
+    low = text.lower()
 
     cm = (re.search(r'data-bids-label="\s*(\d+)\s*Bid', html)
           or re.search(r"(\d+)\s*Bid\(s\)", text))
     count = int(cm.group(1)) if cm else 0
 
-    # next-min bid (clean JS var) — equals the opening amount when there are no bids yet
+    # ENDED — Webkul closes the widget and prints the final hammer price.
+    if "bidding closed" in low or "auction ended at" in low:
+        fm = re.search(r"auction ended at[^0-9]*([\d,]+\.?\d*)", low)
+        cents = round(float(fm.group(1).replace(",", "")) * 100) if fm else None
+        return "ended", cents, count
+
+    # LIVE — the bid form is present (min_bid_amount is a clean JS var only on live lots).
     nm = re.search(r"var\s+min_bid_amount\s*=\s*([\d.]+)", html)
-    next_min = float(nm.group(1)) if nm else None
-    # current highest (only meaningful once someone has bid)
+    if nm is None:
+        return "none", None, 0
+    next_min = float(nm.group(1))
     hm = re.search(r"Maximum bidding amount allowed[^0-9]*([\d,]+\.?\d*)", text)
     highest = float(hm.group(1).replace(",", "")) if hm else None
-
     amount = highest if (count > 0 and highest is not None) else next_min
-    if amount is None:
-        return None
-    return round(amount * 100), count
+    return "live", round(amount * 100), count
 
 
 _METAFIELDS_SET = """
@@ -239,16 +248,15 @@ def set_bid_metafields(prod_id: str, current_bid_cents: int, bid_count: int) -> 
         raise SystemExit(f"metafieldsSet errors for {prod_id}: {errs}")
 
 
-def desired_tags(current: list[str], is_live: bool) -> list[str]:
-    """Reconcile the auction lifecycle tags, preserving every other tag as-is."""
+def desired_tags(current: list[str], state: str) -> list[str]:
+    """Reconcile the auction lifecycle tags for a given state, preserving all other tags."""
     tags = [t for t in current if t not in (AUCTION_TAG, ENDED_TAG)]
-    if is_live:
+    if state == "live":
         tags.append(AUCTION_TAG)
-    else:
-        # Only mark ended if it WAS live (had wk_auction) or is already ended. A product
-        # that was merely pending stays untagged (theme shows "bidding opens soon").
-        if AUCTION_TAG in current or ENDED_TAG in current:
-            tags.append(ENDED_TAG)
+    elif state == "ended":
+        tags.append(ENDED_TAG)
+    # 'none' (pending / no auction configured yet) -> no lifecycle tag; the theme shows
+    # "bidding opens soon".
     return tags
 
 
@@ -257,52 +265,53 @@ def reconcile(dry_run: bool, verbose: bool) -> None:
     if not products:
         print("No products marked listing_type=auction. Nothing to reconcile.")
         return
+    print(f"{len(products)} auction lot(s). Reading Webkul state per lot (authoritative)...")
 
-    live = live_auction_ids([p["id"] for p in products])
-    print(f"{len(products)} auction lot(s); Webkul reports {len(live)} live: "
-          f"{sorted(live) or '(none)'}")
-
-    changed = 0
+    changed = n_live = n_ended = 0
     for p in products:
-        is_live = p["id"] in live
+        # Already-settled ended lots: their final price was captured when they ended, so
+        # skip the (unbounded, growing) re-fetch. A lot mid-transition (both tags) isn't
+        # skipped.
+        if ENDED_TAG in p["tags"] and AUCTION_TAG not in p["tags"]:
+            if verbose:
+                print(f"  ok    {p['title'][:44]:44s} [ended, settled]")
+            continue
 
-        # For live auctions, mirror the current bid + count into metafields so the cards
-        # can show "Current bid ₱X" instead of the unused ₱0 Shopify price. (Lags real time
-        # by at most the sync interval; the product-page widget stays live.)
-        if is_live and not dry_run:
-            bd = fetch_bid_data(p["id"])
-            if bd is not None:
-                cents, count = bd
-                set_bid_metafields(p["id"], cents, count)
-                if verbose:
-                    print(f"  bid   {p['title'][:44]:44s} current=PHP {cents/100:.2f} ({count} bid(s))")
-        elif is_live and dry_run:
-            bd = fetch_bid_data(p["id"])
-            if bd is not None:
-                print(f"  bid   {p['title'][:44]:44s} WOULD set current=PHP {bd[0]/100:.2f} ({bd[1]} bid(s))")
+        state, cents, count = fetch_auction_state(p["id"])
+        if state is None:
+            print(f"  skip  {p['title'][:44]:44s} (Webkul fetch error — leaving unchanged)")
+            continue
+        if state == "live":
+            n_live += 1
+        elif state == "ended":
+            n_ended += 1
 
-        want = desired_tags(p["tags"], is_live)
-        # compare as sets on the two lifecycle tags only (order-insensitive)
+        # Mirror bid figures into metafields — current highest for live, FINAL price for
+        # ended (so cards/PDP + reserve status are right after the hammer falls).
+        if cents is not None and not dry_run:
+            set_bid_metafields(p["id"], cents, count)
+
+        want = desired_tags(p["tags"], state)
         now_life = {t for t in p["tags"] if t in (AUCTION_TAG, ENDED_TAG)}
         want_life = {t for t in want if t in (AUCTION_TAG, ENDED_TAG)}
-        state = "LIVE" if is_live else "not-live"
+        bidinfo = f"  bid=PHP {cents/100:.2f} ({count})" if cents is not None else ""
         if now_life == want_life:
             if verbose:
-                print(f"  ok    {p['title'][:44]:44s} [{state}] tags={sorted(now_life) or '—'}")
+                print(f"  ok    {p['title'][:44]:44s} [{state}]{bidinfo}")
             continue
 
         action = f"{sorted(now_life) or '—'} -> {sorted(want_life) or '—'}"
         if dry_run:
-            print(f"  WOULD {p['title'][:44]:44s} [{state}] {action}")
+            print(f"  WOULD {p['title'][:44]:44s} [{state}] {action}{bidinfo}")
         else:
             _admin("PUT", f"/products/{p['id']}.json",
                    {"product": {"id": int(p["id"]), "tags": ", ".join(want)}})
-            print(f"  set   {p['title'][:44]:44s} [{state}] {action}")
+            print(f"  set   {p['title'][:44]:44s} [{state}] {action}{bidinfo}")
         changed += 1
 
     verb = "would change" if dry_run else "changed"
-    print(f"Done. {changed} product(s) {verb}.")
-    _log(f"OK: {len(products)} auction lot(s), {len(live)} live, {changed} {verb}"
+    print(f"Done. {n_live} live, {n_ended} ended; {changed} product(s) {verb}.")
+    _log(f"OK: {len(products)} lots, {n_live} live, {n_ended} ended, {changed} {verb}"
          + (" [dry-run]" if dry_run else ""))
 
 
