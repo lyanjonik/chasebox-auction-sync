@@ -1,0 +1,2 @@
+# No third-party dependencies — Python standard library only (urllib, json, sqlite3).
+# Requires Python 3.9+. Nothing to install; the workflow runs the script directly.
